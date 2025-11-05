@@ -13,6 +13,8 @@ services:
     depends_on:
       generate-schemas:
         condition: service_completed_successfully
+      redis:
+        condition: service_started
 
     # NOTE: All service containers will use the same network and IP. All ports
     # must be configured on the first.
