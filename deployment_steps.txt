@@ -1,0 +1,54 @@
+# Redeploying tcp-info sidecar, redis, and ndt-fullstack
+
+   cd /home/haarika/imp_files/turbotest_deployment/tcp-info-Turbotest-implementation
+   docker build -t tcp-info-custom .
+
+   cd /home/haarika/imp_files/turbotest_deployment/ndt-server-TurboTest-implementation
+   docker build -t ndt-fullstack:custom -f Dockerfile .
+
+   docker network create ndt-net || true
+
+   cd /home/haarika/imp_files/turbotest_deployment/ndt-server-TurboTest-implementation
+   install -d certs datadir var-local
+   ./gen_local_test_certs.bash   # or copy in your production cert/key
+
+1. Stop existing containers (if they exist):
+   docker stop ndt-fullstack redis || true
+
+2. Remove the stopped containers so we can recreate them cleanly:
+   docker rm ndt-fullstack redis || true
+
+3. Start redis first so ndt can connect immediately:
+   cd /home/haarika/imp_files/turbotest_deployment/ndt-server-TurboTest-implementation
+   docker run -d --name redis \
+     --network ndt-net \
+     --restart unless-stopped \
+     -p 6379:6379 \
+       redis:alpine \
+       redis-server
+
+4. Start ndt-fullstack using the new host ports (all prefixed with 1) and point it at redis:
+   docker run -d --name ndt-fullstack \
+     --network ndt-net \
+     --restart unless-stopped \
+     -p 14443:14443 -p 18080:18080 \
+     -p 19990:19990 -p 19991:19991 -p 19992:19992 -p 19993:19993 \
+     -v "$PWD/datadir":/var/spool/ndt \
+     -v "$PWD/var-local":/var/local \
+     -v "$PWD/certs":/certs:ro \
+     -e REDIS_ADDR=redis:6379 \
+     ndt-fullstack:custom \
+     --cert=/certs/cert.pem \
+     --key=/certs/key.pem \
+     --ndt7_addr_cleartext=:18080 \
+     --ndt7_addr=:14443 \
+     --prometheusx.listen-address=:19990
+
+5. Verify both containers are healthy and exposing the expected ports:
+   docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
+
+6. (Optional) Inspect redis for activity:
+   docker exec redis redis-cli --scan | head
+
+7. (Optional) Tail ndt logs for any startup errors:
+   docker logs -f ndt-fullstack

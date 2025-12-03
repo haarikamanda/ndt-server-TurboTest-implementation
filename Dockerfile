@@ -6,10 +6,10 @@ FROM measurementlab/traceroute-caller
 # unique string written to a well-known location to serve as a prefix.
 COPY --from=measurementlab/uuid /create-uuid-prefix-file /
 
-# tcp-info needs its binary and also needs zstd
-COPY --from=measurementlab/tcp-info /bin/tcp-info /tcp-info
-COPY --from=measurementlab/tcp-info /bin/zstd /bin/zstd
-COPY --from=measurementlab/tcp-info /licences/zstd/ /licences/zstd/
+# tcp-info needs its binary and also needs zstd (use custom build)
+COPY --from=tcp-info-custom /bin/tcp-info /tcp-info
+COPY --from=tcp-info-custom /bin/zstd /bin/zstd
+COPY --from=tcp-info-custom /licences/zstd/ /licences/zstd/
 
 # packet-headers needs its binary and libpcap.  There's no good way to get both
 # easily from the image, due to C-linking issues and the differences between
