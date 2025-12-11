@@ -23,7 +23,7 @@ type fakeServer struct {
 
 func (f *fakeServer) Listen() error               { return nil }
 func (f *fakeServer) Serve(context.Context) error { return nil }
-func (f *fakeServer) FlowCreated(timestamp time.Time, uuid string, sockid inetdiag.SockID) {
+func (f *fakeServer) FlowCreated(timestamp time.Time, uuid string, sockid inetdiag.SockID, testType ...string) {
 	f.created++
 }
 func (f *fakeServer) FlowDeleted(timestamp time.Time, uuid string) {

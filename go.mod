@@ -47,3 +47,5 @@ require (
 	google.golang.org/protobuf v1.30.0 // indirect
 	gopkg.in/square/go-jose.v2 v2.6.0 // indirect
 )
+
+replace github.com/m-lab/tcp-info => ../tcp-info-Turbotest-implementation
