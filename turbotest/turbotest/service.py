@@ -4,7 +4,8 @@ Redis protocol (shared with ndt-server and tcp-info):
 
   turbotest:queue            LIST   ndt-server RPUSHes a JSON job when a download
                                     with turbotest=enforce|shadow starts:
-                                    {"uuid": "...", "mode": "enforce", "start_ns": 1700000000000000000}
+                                    {"uuid": "...", "mode": "enforce", "epsilon": 15}
+                                    (epsilon: which Stage 2 classifier; default --epsilon)
   table_1:<uuid>             LIST   tcp-info RPUSHes one row per archived snapshot:
                                     ts_ns,BytesAcked,RTT,SndCwnd,BytesSent,BytesRetrans,Retransmits,CwndGain
   table_2:<uuid>             STRING termination flag. ndt-server sets "0" at start,
@@ -83,9 +84,14 @@ class Service:
                 continue
             if uuid in self.jobs:
                 continue
-            self.jobs[uuid] = Job(uuid, j.get("mode", "enforce"), time.time_ns(), TurboTestSession(self.models))
+            try:
+                eps = int(j.get("epsilon") or self.models.epsilon)
+            except (TypeError, ValueError):
+                eps = self.models.epsilon
+            sess = TurboTestSession(self.models, eps)
+            self.jobs[uuid] = Job(uuid, j.get("mode", "enforce"), time.time_ns(), sess)
             self.n_jobs += 1
-            log.info("job %s mode=%s", uuid, j.get("mode"))
+            log.info("job %s mode=%s epsilon=%d", uuid, j.get("mode"), sess.epsilon)
 
     # ---- one poll cycle ---------------------------------------------------
     def step(self) -> None:
@@ -140,7 +146,7 @@ class Service:
             "uuid": jb.uuid,
             "mode": jb.mode,
             "status": "stop",
-            "epsilon": self.models.epsilon,
+            "epsilon": s.epsilon,
             "tau": d.tau,
             "stop_after_ms": f"{d.elapsed_ms:.1f}",
             "predicted_mbps": f"{d.predicted_bps / 1e6:.6f}",
@@ -164,14 +170,14 @@ class Service:
     def _no_stop_fields(self, jb: Job) -> dict:
         s = jb.session
         return {
-            "uuid": jb.uuid, "mode": jb.mode, "status": "no_stop", "epsilon": self.models.epsilon,
+            "uuid": jb.uuid, "mode": jb.mode, "status": "no_stop", "epsilon": s.epsilon,
             "n_rows": s.features.n_rows, "n_snapshots": s.features.n_snapshots,
             "probs": json.dumps({str(k): round(v, 4) for k, v in s.probs.items()}),
             "reg_mbps": json.dumps({str(k): round(v / 1e6, 3) for k, v in s.reg_pred_bps.items()}),
         }
 
     def run(self) -> None:
-        log.info("TurboTest service ready (epsilon=%d, poll=%.1f ms)", self.models.epsilon, self.poll_s * 1e3)
+        log.info("TurboTest service ready (default epsilon=%d, poll=%.1f ms)", self.models.epsilon, self.poll_s * 1e3)
         while self.running:
             t0 = time.perf_counter()
             try:
@@ -188,7 +194,10 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="TurboTest real-time early-termination service")
     ap.add_argument("--redis-addr", default=os.environ.get("REDIS_ADDR", "localhost:6379"))
     ap.add_argument("--model-dir", default=os.environ.get("TURBOTEST_MODEL_DIR", "/models"))
-    ap.add_argument("--epsilon", type=int, default=int(os.environ.get("TURBOTEST_EPSILON", "15")))
+    ap.add_argument("--epsilon", type=int, default=int(os.environ.get("TURBOTEST_EPSILON", "15")),
+                    help="default epsilon for tests that do not ask for one")
+    ap.add_argument("--epsilons", default=os.environ.get("TURBOTEST_EPSILONS", "5,10,15,20,25,30,35"),
+                    help="classifiers to load; a test may request any of them")
     ap.add_argument("--threshold", type=float, default=float(os.environ.get("TURBOTEST_THRESHOLD", "0.5")))
     ap.add_argument("--backend", choices=["onnx", "torch"], default=os.environ.get("TURBOTEST_BACKEND", "onnx"))
     ap.add_argument("--poll-ms", type=float, default=float(os.environ.get("TURBOTEST_POLL_MS", "5")))
@@ -201,15 +210,17 @@ def main() -> None:
     r = redis.Redis(host=host or "localhost", port=int(port), socket_timeout=2)
     r.ping()
     t0 = time.time()
-    models = TurboTestModels(a.model_dir, a.epsilon, a.backend, a.threshold, a.onnx_cache)
+    eps = [int(e) for e in a.epsilons.split(",") if e]
+    models = TurboTestModels(a.model_dir, a.epsilon, a.backend, a.threshold, a.onnx_cache, eps)
     # Warm up both stages so the first test does not pay one-time costs.
     from .models import classifier_input, regressor_input
     import numpy as np
 
     m = np.ones((10, 13))
     p = models.regressor.predict_bps(regressor_input(m, 5))
-    models.classifier.prob(classifier_input(m, 5, {5: p}))
-    log.info("models loaded in %.1fs", time.time() - t0)
+    for c in models.classifiers.values():
+        c.prob(classifier_input(m, 5, {5: p}))
+    log.info("models loaded in %.1fs (epsilons %s)", time.time() - t0, sorted(models.classifiers))
 
     svc = Service(r, models, poll_ms=a.poll_ms)
 

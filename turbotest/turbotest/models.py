@@ -204,23 +204,35 @@ class Decision:
 
 
 class TurboTestModels:
-    """Both stages, shared by all concurrent tests in one process."""
+    """Both stages, shared by all concurrent tests in one process.
+
+    One regressor (Stage 1 does not depend on epsilon) and one classifier per
+    loaded epsilon (Stage 2 is trained per epsilon). Each test picks its epsilon.
+    """
 
     def __init__(self, model_dir: str, epsilon: int = 15, backend: str = "onnx",
-                 threshold: float = 0.5, onnx_cache_dir: Optional[str] = None):
+                 threshold: float = 0.5, onnx_cache_dir: Optional[str] = None,
+                 epsilons: Optional[list] = None):
         self.regressor = Regressor(model_dir)
-        self.classifier = Classifier(model_dir, epsilon, backend, onnx_cache_dir)
+        self.epsilon = epsilon  # default for tests that do not ask for one
+        eps = sorted(set((epsilons or []) + [epsilon]))
+        self.classifiers = {e: Classifier(model_dir, e, backend, onnx_cache_dir) for e in eps}
         self.threshold = threshold
-        self.epsilon = epsilon
+
+    @property
+    def classifier(self) -> "Classifier":
+        return self.classifiers[self.epsilon]
 
 
 class TurboTestSession:
     """Per-test state: streaming features, regressor history, decision."""
 
-    def __init__(self, models: TurboTestModels):
+    def __init__(self, models: TurboTestModels, epsilon: Optional[int] = None):
         from .features import StreamingFeatureBuilder
 
         self.models = models
+        self.epsilon = epsilon if epsilon in models.classifiers else models.epsilon
+        self.classifier = models.classifiers[self.epsilon]
         self.features = StreamingFeatureBuilder()
         self.reg_pred_bps: Dict[int, float] = {}
         self.probs: Dict[int, float] = {}
@@ -255,7 +267,7 @@ class TurboTestSession:
         c_ms = 0.0
         out = None
         if self.decision is None and n in CLASSIFIER_TAUS:
-            p = self.models.classifier.prob(classifier_input(m, n, self.reg_pred_bps))
+            p = self.classifier.prob(classifier_input(m, n, self.reg_pred_bps))
             c_ms = (time.perf_counter() - t1) * 1e3
             self.probs[n] = p
             if p >= self.models.threshold:
