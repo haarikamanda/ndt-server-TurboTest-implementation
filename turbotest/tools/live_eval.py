@@ -52,6 +52,40 @@ CONDITIONS = {
 }
 
 
+# NetForge (netreplica solo) conditions: (down_mbps, up_mbps, latency_ms, qdisc, ctp pcap or None).
+# Shaping is HTB + AQM on the downstream veth, latency is netem on the upstream
+# side, and CTP replays real cross traffic through the same bottleneck.
+NETFORGE_CONDITIONS = {
+    "nf_25M_30ms_fqcodel": (25, 10, 30, "fq_codel", None),
+    "nf_50M_60ms_pfifo": (50, 20, 60, "pfifo limit 1000", None),
+    "nf_100M_20ms_fqcodel": (100, 20, 20, "fq_codel", None),
+    "nf_100M_20ms_ctp": (100, 20, 20, "fq_codel", "on_70_profile8.pcap"),
+    "nf_300M_15ms_fqcodel": (300, 50, 15, "fq_codel", None),
+    "nf_40M_100ms_ctp": (40, 10, 100, "fq_codel", "on_70_profile8.pcap"),
+}
+
+
+def nf_exec(container, code):
+    return sh(["docker", "exec", "-w", "/workspace", container, "python3", "-c",
+               "import controler as c; " + code])
+
+
+def set_netforge_condition(container, name):
+    down, up, lat, qdisc, _ = NETFORGE_CONDITIONS[name]
+    nf_exec(container, f"c.shaping({down}, {up}, {qdisc!r}); c.latency({lat})")
+    return sh(["docker", "exec", container, "tc", "qdisc", "show"]).stdout.replace("\n", " | ")
+
+
+def start_ctp(container, pcap):
+    """Replay the cross-traffic profile in both directions (background)."""
+    sh(["docker", "exec", "-d", "-w", "/workspace", container, "python3", "-c",
+        f"import controler as c; c.ctp('/ctps/', {pcap!r})"])
+
+
+def stop_ctp(container):
+    sh(["docker", "exec", container, "pkill", "-f", "tcpreplay"], check=False)
+
+
 def sh(cmd, check=True):
     return subprocess.run(cmd, check=check, capture_output=True, text=True)
 
@@ -73,9 +107,13 @@ def set_condition(container, dev, name):
     return sh(["docker", "exec", container, "tc", "qdisc", "show", "dev", dev]).stdout.strip()
 
 
-def run_client(client, server, mode=None, eps=None, timeout=40):
+def run_client(client, server, mode=None, eps=None, timeout=40, netforge=None):
     cmd = [client, "-server", server, "-scheme", "ws", "-upload=false", "-format", "json",
            "-client-name", "turbotest-live"]
+    if netforge:
+        # Run the client in NetForge's downstream namespace: all download
+        # traffic crosses the NetForge bottleneck.
+        cmd = ["docker", "exec", netforge, "ip", "netns", "exec", "ns1", "/ndt7-client"] + cmd[1:]
     if mode:
         cmd += ["-turbotest", mode]
         if eps:
@@ -150,6 +188,7 @@ def main():
     ap.add_argument("--n-enforce", type=int, default=2, help="per epsilon")
     ap.add_argument("--epsilons", default=",".join(map(str, EPSILONS)))
     ap.add_argument("--out", default="results/live")
+    ap.add_argument("--netforge", help="NetForge container: run the client in its ns1 and use NETFORGE_CONDITIONS")
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
     host, port = a.redis.rsplit(":", 1)
@@ -158,15 +197,27 @@ def main():
     raw_path = os.path.join(a.out, "live_tests.jsonl")
     raw = open(raw_path, "a")
 
+    if a.netforge and a.conditions == ",".join(CONDITIONS):
+        a.conditions = ",".join(NETFORGE_CONDITIONS)
     for cond in a.conditions.split(","):
-        qd = set_condition(a.container, a.dev, cond)
+        if a.netforge:
+            set_condition(a.container, a.dev, "local")  # no shaping on the server side
+            qd = set_netforge_condition(a.netforge, cond)
+        else:
+            qd = set_condition(a.container, a.dev, cond)
+        ctp = NETFORGE_CONDITIONS[cond][4] if a.netforge else None
         print(f"\n=== condition {cond}: {qd}", flush=True)
         time.sleep(1)
         plan = [("baseline", None)] * a.n_baseline + [("shadow", 15)] * a.n_shadow
         plan += [("enforce", e) for e in eps_list for _ in range(a.n_enforce)]
         for kind, eps in plan:
             mode = None if kind == "baseline" else kind
-            res = run_client(a.client, a.server, mode, eps)
+            if ctp:
+                start_ctp(a.netforge, ctp)
+                time.sleep(1)  # let the cross traffic reach steady state
+            res = run_client(a.client, a.server, mode, eps, netforge=a.netforge)
+            if ctp:
+                stop_ctp(a.netforge)
             rec = {"condition": cond, "kind": kind, "epsilon": eps, "time": time.time(), **res}
             uuid = res["uuid"]
             if uuid:
@@ -193,6 +244,8 @@ def main():
                   f"{' tau=%d' % tt['Tau'] if tt.get('Tau') else ''} uuid={uuid}", flush=True)
             time.sleep(0.5)
     set_condition(a.container, a.dev, "local")
+    if a.netforge:
+        nf_exec(a.netforge, "c.latency(0)")
     raw.close()
     print(f"\nraw results: {raw_path}\nnow run: python -m tools.live_report {raw_path}")
 
