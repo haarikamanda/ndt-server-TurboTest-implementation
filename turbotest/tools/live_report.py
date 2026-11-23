@@ -84,7 +84,8 @@ def summarize(recs):
     conds = list(dict.fromkeys(r["condition"] for r in recs))
     eps_all = sorted({int(e) for r in recs if r["kind"] == "shadow" for e in (r.get("shadow") or {})})
     per_eps_all = defaultdict(list)
-    enf_all = defaultdict(list)  # eps -> [(b_tau, b_sent, b_ref, delays)]
+    enf_all = defaultdict(list)  # eps -> [(b_tau, b_sent, b_ref)]
+    enf_err = defaultdict(list)  # eps -> relative errors vs the baseline throughput
     for c in conds:
         rs = [r for r in recs if r["condition"] == c and r.get("rc") == 0]
         base = [r for r in rs if r["kind"] == "baseline" and r.get("T_mbps")]
@@ -118,6 +119,10 @@ def summarize(recs):
             dl = [x for x in (stop_delays_ms(r) for r in es) if x]
             if B_ref == B_ref:
                 enf_all[e] += [(bt, bs, B_ref) for bt, bs in eb]
+            if T_ref == T_ref:
+                # Paper convention: a test that is not stopped has error 0.
+                enf_err[e] += [abs(t["PredictedMbps"] - T_ref) / T_ref if t.get("TerminatedEarly") else 0.0
+                               for r, t in zip(es, tts) if r.get("prefix_bytes")]
                 out.setdefault("_delays", []).extend(dl)
             cs["enforce"][e] = {
                 "n": len(es),
@@ -142,7 +147,8 @@ def summarize(recs):
     for e, v in sorted(enf_all.items()):
         ref = sum(b for _, _, b in v)
         at, sent = sum(x[0] for x in v) / ref * 100, sum(x[1] for x in v) / ref * 100
-        out["overall_enforce"][e] = {"n": len(v), "data_at_tau_pct": at, "data_sent_pct": sent,
+        out["overall_enforce"][e] = {"n": len(v), "median_rel_err_pct": med(enf_err[e]) * 100,
+                                     "data_at_tau_pct": at, "data_sent_pct": sent,
                                      "lost_pct_points": sent - at}
     dl = out.pop("_delays", [])
     q = lambda a, p: float(np.percentile(a, p)) if a else float("nan")  # noqa: E731
@@ -164,9 +170,9 @@ def print_report(s):
               f"{v['stopped_pct']:>10.0f} {v['median_stop_s']:>11.2f}")
     if s["overall_enforce"]:
         print("\nPer-epsilon, all conditions (enforce tests: real stops; % of the baseline bytes):")
-        print(f"{'eps':>4} {'n':>4} {'data at tau %':>14} {'data sent %':>12} {'lost (points)':>14}")
+        print(f"{'eps':>4} {'n':>4} {'med err %':>10} {'data at tau %':>14} {'data sent %':>12} {'lost (points)':>14}")
         for e, v in s["overall_enforce"].items():
-            print(f"{e:>4} {v['n']:>4} {v['data_at_tau_pct']:>14.1f} {v['data_sent_pct']:>12.1f} "
+            print(f"{e:>4} {v['n']:>4} {v['median_rel_err_pct']:>10.1f} {v['data_at_tau_pct']:>14.1f} {v['data_sent_pct']:>12.1f} "
                   f"{v['lost_pct_points']:>14.1f}")
         d = s["stop_delays_ms"]
         a, b = d["bin_end_to_decision"], d["bin_end_to_server_flag"]
