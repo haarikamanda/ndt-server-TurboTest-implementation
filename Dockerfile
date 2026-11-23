@@ -4,7 +4,7 @@ WORKDIR /go/src/github.com/m-lab/ndt-server
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 go install -tags netgo \
+RUN go install -tags netgo \
       -ldflags "-X github.com/m-lab/ndt-server/version.Version=turbotest -extldflags -static" .
 
 # Traceroute-caller is the most brittle of our tools, as it requires
