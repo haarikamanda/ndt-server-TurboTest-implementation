@@ -20,6 +20,14 @@ import (
 type Params struct {
 	IsEarlyExit bool
 	MaxBytes    int64
+
+	// TurboTestStop, when closed, ends the download early (TurboTest).
+	// A nil channel never fires.
+	TurboTestStop <-chan struct{}
+	// TurboTestResult is called when the sender stops because of
+	// TurboTestStop; it returns the decision sent to the client in the last
+	// message before the connection is closed. It may be nil.
+	TurboTestResult func() *model.TurboTest
 }
 
 func makePreparedMessage(size int) (*websocket.PreparedMessage, error) {
@@ -104,6 +112,24 @@ func Start(ctx context.Context, conn *websocket.Conn, data *model.ArchivalData, 
 					proto, string(spec.SubtestDownload), "measurer-closed-early").Inc()
 				return nil
 			}
+		case <-params.TurboTestStop:
+			// TurboTest decided that enough data was collected. Tell the
+			// client the predicted throughput, then close like early_exit.
+			// The message is not appended to data.ServerMeasurements: the
+			// last archived measurement must keep its TCPInfo (rate
+			// computations read it); the decision is archived in
+			// data.TurboTest instead.
+			final := model.Measurement{}
+			if params.TurboTestResult != nil {
+				final.TurboTest = params.TurboTestResult()
+			}
+			if err := conn.WriteJSON(final); err != nil {
+				logging.Logger.WithError(err).Warn("sender: conn.WriteJSON (turbotest) failed")
+			}
+			closer.StartClosing(conn)
+			ndt7metrics.ClientSenderErrors.WithLabelValues(
+				proto, string(spec.SubtestDownload), "turbotest-closed-early").Inc()
+			return nil
 		default:
 			if err := conn.WritePreparedMessage(preparedMessage); err != nil {
 				logging.Logger.WithError(err).Warn(
