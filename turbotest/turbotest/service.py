@@ -35,6 +35,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List
 
 import redis
+from prometheus_client import Counter, Gauge, Histogram, start_http_server
 
 from .features import Snapshot
 from .models import TurboTestModels, TurboTestSession, run_batched
@@ -47,7 +48,19 @@ T2 = "table_2:"
 RESULT = "turbotest:result:"
 DONE = "turbotest:done:"
 SHADOW = "turbotest:shadow:"
-STATS_KEY = "turbotest:stats"
+
+# Prometheus metrics (exported on --metrics-port, default 9994).
+M_JOBS = Counter("turbotest_jobs_total", "Tests registered by ndt-server", ["mode"])
+M_DECISIONS = Counter("turbotest_decisions_total", "Tests finished, by outcome", ["outcome", "epsilon"])
+M_ACTIVE = Gauge("turbotest_active_jobs", "Tests currently followed")
+M_REJECTED = Counter("turbotest_jobs_rejected_total", "Jobs dropped (bad JSON or --max-jobs reached)", ["reason"])
+M_ERRORS = Counter("turbotest_errors_total", "Errors in the service loop", ["type"])
+M_STEP = Histogram("turbotest_step_seconds", "Duration of one poll cycle",
+                   buckets=(.0005, .001, .002, .005, .01, .02, .05, .1, .25, .5, 1))
+M_INFER = Histogram("turbotest_inference_batch_seconds", "Stage 1 + Stage 2 batch time per poll cycle",
+                    buckets=(.0005, .001, .002, .005, .01, .02, .05, .1, .25, .5))
+M_SNAPS = Counter("turbotest_snapshots_total", "tcp-info snapshots read from table_1")
+M_BAD_ROWS = Counter("turbotest_bad_rows_total", "table_1 rows that could not be parsed")
 
 
 @dataclass
@@ -69,13 +82,15 @@ class Job:
 
 class Service:
     def __init__(self, r: redis.Redis, models: TurboTestModels, poll_ms: float = 5.0,
-                 max_test_s: float = 16.0, key_ttl_s: int = 300, clock_close_ms: float = 50.0):
+                 max_test_s: float = 16.0, key_ttl_s: int = 300, clock_close_ms: float = 50.0,
+                 max_jobs: int = 5000):
         self.r = r
         self.models = models
         self.poll_s = poll_ms / 1e3
         self.max_test_ns = int(max_test_s * 1e9)
         self.ttl = key_ttl_s
         self.clock_margin_ns = int(clock_close_ms * 1e6)
+        self.max_jobs = max_jobs
         self.jobs: Dict[str, Job] = {}
         self.running = True
         self.n_decisions = 0
@@ -87,11 +102,17 @@ class Service:
         for item in raw or []:
             try:
                 j = json.loads(item)
-                uuid = j["uuid"]
+                uuid = str(j["uuid"])
             except Exception:
                 log.warning("bad job %r", item)
+                M_REJECTED.labels("bad_job").inc()
                 continue
             if uuid in self.jobs:
+                continue
+            if len(self.jobs) >= self.max_jobs:
+                # Bounded memory: the test then simply runs to completion.
+                log.warning("max jobs (%d) reached; not following %s", self.max_jobs, uuid)
+                M_REJECTED.labels("max_jobs").inc()
                 continue
             try:
                 eps = int(j.get("epsilon") or self.models.epsilon)
@@ -107,6 +128,7 @@ class Service:
                               for e in sorted(self.models.classifiers)}
             self.jobs[uuid] = jb
             self.n_jobs += 1
+            M_JOBS.labels(mode).inc()
             log.info("job %s mode=%s epsilon=%d", uuid, j.get("mode"), sess.epsilon)
 
     # ---- one poll cycle ---------------------------------------------------
@@ -130,10 +152,12 @@ class Service:
             done_flags[jb.uuid] = done
             jb.offset += len(rows)
             sessions = jb.sessions()
+            M_SNAPS.inc(len(rows))
             for row in rows:
                 try:
                     snap = Snapshot.parse(row.decode() if isinstance(row, bytes) else row)
-                except ValueError:
+                except (ValueError, UnicodeDecodeError):
+                    M_BAD_ROWS.inc()
                     continue
                 for sess in sessions:
                     sess.add(snap)
@@ -150,6 +174,8 @@ class Service:
                 all_sessions.append(sess)
         decided = run_batched(self.models, all_sessions)
         batch_ms = (time.perf_counter() - t0) * 1e3
+        if any(x.timings_ms and x.timings_ms[-1][0] for x in all_sessions):
+            M_INFER.observe(batch_ms / 1e3)
         for sess, d in decided:
             jb = owner[id(sess)]
             if sess is jb.session:
@@ -172,6 +198,7 @@ class Service:
             if jb.session.decision is None:
                 writes.hset(RESULT + jb.uuid, mapping=self._no_stop_fields(jb))
                 writes.expire(RESULT + jb.uuid, self.ttl)
+                M_DECISIONS.labels("no_stop", str(jb.session.epsilon)).inc()
             for sess in jb.all_eps.values():
                 if sess.decision is None:
                     self._write_shadow(writes, jb, sess, None)
@@ -182,6 +209,7 @@ class Service:
         for jb in jobs:
             if jb.finished:
                 self.jobs.pop(jb.uuid, None)
+        M_ACTIVE.set(len(self.jobs))
 
     def _write_decision(self, pipe, jb: Job, d, batch_ms: float = 0.0) -> None:
         now = time.time_ns()
@@ -208,8 +236,8 @@ class Service:
         pipe.hset(RESULT + jb.uuid, mapping=fields)
         pipe.expire(RESULT + jb.uuid, self.ttl)
         pipe.set(T2 + jb.uuid, 1, ex=self.ttl)
-        pipe.hincrby(STATS_KEY, "decisions", 1)
         self.n_decisions += 1
+        M_DECISIONS.labels("stop", str(s.epsilon)).inc()
         log.info("STOP %s tau=%d (%.0f ms) pred=%.2f Mbit/s p=%.3f", jb.uuid, d.tau, d.elapsed_ms,
                  d.predicted_bps / 1e6, d.probability)
 
@@ -241,10 +269,19 @@ class Service:
             t0 = time.perf_counter()
             try:
                 self.step()
-            except redis.exceptions.ConnectionError as e:
+            except redis.exceptions.RedisError as e:
+                # Redis restarts or network errors: keep the jobs, retry soon.
+                M_ERRORS.labels("redis").inc()
                 log.warning("redis: %s", e)
-                time.sleep(1)
+                time.sleep(0.5)
+            except Exception:
+                # Never let one bad test stop the service: drop all current
+                # jobs (their downloads then run to full length) and go on.
+                M_ERRORS.labels("internal").inc()
+                log.exception("service step failed; dropping %d active jobs", len(self.jobs))
+                self.jobs.clear()
             dt = time.perf_counter() - t0
+            M_STEP.observe(dt)
             if dt < self.poll_s:
                 time.sleep(self.poll_s - dt)
 
@@ -262,12 +299,26 @@ def main() -> None:
     ap.add_argument("--poll-ms", type=float, default=float(os.environ.get("TURBOTEST_POLL_MS", "5")))
     ap.add_argument("--onnx-cache", default=os.environ.get("TURBOTEST_ONNX_CACHE"))
     ap.add_argument("--log-level", default=os.environ.get("TURBOTEST_LOG_LEVEL", "INFO"))
+    ap.add_argument("--metrics-port", type=int, default=int(os.environ.get("TURBOTEST_METRICS_PORT", "9994")),
+                    help="Prometheus /metrics port (0 disables)")
+    ap.add_argument("--max-jobs", type=int, default=int(os.environ.get("TURBOTEST_MAX_JOBS", "5000")))
     a = ap.parse_args()
     logging.basicConfig(level=a.log_level, format="%(asctime)s %(levelname)s %(message)s")
 
     host, _, port = a.redis_addr.rpartition(":")
-    r = redis.Redis(host=host or "localhost", port=int(port), socket_timeout=2)
-    r.ping()
+    r = redis.Redis(host=host or "localhost", port=int(port), socket_timeout=2,
+                    socket_connect_timeout=2, health_check_interval=10)
+    for attempt in range(60):  # Redis may start after this container.
+        try:
+            r.ping()
+            break
+        except redis.exceptions.RedisError as e:
+            log.warning("waiting for redis at %s: %s", a.redis_addr, e)
+            time.sleep(1)
+    else:
+        raise SystemExit(f"redis at {a.redis_addr} not reachable")
+    if a.metrics_port:
+        start_http_server(a.metrics_port)
     t0 = time.time()
     eps = [int(e) for e in a.epsilons.split(",") if e]
     models = TurboTestModels(a.model_dir, a.epsilon, a.backend, a.threshold, a.onnx_cache, eps)
@@ -281,7 +332,7 @@ def main() -> None:
         c.prob(classifier_input(m, 5, {5: p}))
     log.info("models loaded in %.1fs (epsilons %s)", time.time() - t0, sorted(models.classifiers))
 
-    svc = Service(r, models, poll_ms=a.poll_ms)
+    svc = Service(r, models, poll_ms=a.poll_ms, max_jobs=a.max_jobs)
 
     def stop(*_):
         svc.running = False

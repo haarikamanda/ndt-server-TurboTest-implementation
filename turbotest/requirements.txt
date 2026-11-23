@@ -11,3 +11,4 @@ pyarrow>=14
 redis>=5
 joblib
 pytest
+prometheus_client>=0.17
