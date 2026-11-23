@@ -10,10 +10,10 @@
 #   MODEL_DIR=/path/to/model_shared ./run_stack.sh            # start
 #   ./run_stack.sh stop                                       # stop and remove
 #
-# Build the images first (from the repository roots):
-#   (cd tcp-info-Turbotest-implementation && docker build -t tcp-info-custom .)
-#   (cd ndt-server-TurboTest-implementation && docker build -t ndt-fullstack:custom .)
-#   (cd ndt-server-TurboTest-implementation/turbotest && docker build -t turbotest-service .)
+# Build the images first (from the repository root):
+#   docker build -t tcp-info-custom tcp-info
+#   docker build -t ndt-fullstack:custom .
+#   docker build -t turbotest-service turbotest
 set -euo pipefail
 
 NET=${NET:-ndt-net}

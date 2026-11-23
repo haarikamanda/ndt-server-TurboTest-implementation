@@ -19,7 +19,7 @@ Metrics (paper §5.1), per shadow test and epsilon:
 For enforce tests: real duration and bytes, compared with the baseline
 tests of the same condition.
 
-Usage (see README): python -m tools.live_eval --client ../../ndt7-client-go-snl/ndt7-client ...
+Usage (see README): python -m tools.live_eval --client ../ndt7-client/ndt7-client ...
 """
 
 import argparse

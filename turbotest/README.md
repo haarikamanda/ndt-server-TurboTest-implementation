@@ -47,16 +47,17 @@ ndt-server   --polls table_2 every 10 ms; enforce: final message with the predic
 
 ## Run
 
-```
-# images (once)
-(cd ../../tcp-info-Turbotest-implementation && docker build -t tcp-info-custom .)
-(cd .. && docker build -t ndt-fullstack:custom .)
-docker build -t turbotest-service .
+See [the setup guide in the top-level README](../README.md#turbotest-real-time-early-termination)
+for the full steps. In short, from the repository root:
 
-# stack
-MODEL_DIR=/path/to/model_shared deploy/run_stack.sh
-./ndt7-client -server localhost:18080 -scheme ws -upload=false -turbotest enforce -turbotest-epsilon 15
-deploy/run_stack.sh stop
+```
+docker build -t tcp-info-custom tcp-info
+docker build -t ndt-fullstack:custom .
+docker build -t turbotest-service turbotest
+MODEL_DIR=/path/to/model_shared turbotest/deploy/run_stack.sh
+(cd ndt7-client && go build -o ndt7-client ./cmd/ndt7-client)
+ndt7-client/ndt7-client -server localhost:18080 -scheme ws -upload=false -turbotest enforce -turbotest-epsilon 15
+turbotest/deploy/run_stack.sh stop
 ```
 
 The service without Docker:
@@ -81,7 +82,6 @@ Service options (flag / environment variable):
 
 ndt-server flags: `-turbotest.redis-addr` (default `$REDIS_ADDR`; empty
 disables TurboTest) and `-turbotest.poll-interval` (default 10 ms).
-tcp-info writes to Redis only when `REDIS_ADDR` is set.
 
 Failure behavior: if Redis or the service is unavailable, or the service
 does not decide, the download runs to its normal length. TurboTest can only
