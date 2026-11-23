@@ -31,6 +31,23 @@ var ValidEarlyExitValues = []string{"250"}
 // ndt7 download tests once the test has transferred as many MB as the parameter's value.
 const EarlyExitParameterName = "early_exit"
 
+// TurboTestParameterName is the request parameter that enables TurboTest
+// early termination for a download: "enforce" stops the test when the
+// TurboTest service says so, "shadow" only records the decision.
+const TurboTestParameterName = "turbotest"
+
+// TurboTestEpsilonParameterName selects the Stage 2 classifier (epsilon).
+const TurboTestEpsilonParameterName = "turbotest_epsilon"
+
+// ValidTurboTestModes are the accepted values of the turbotest parameter.
+var ValidTurboTestModes = []string{"enforce", "shadow"}
+
+// ValidTurboTestEpsilons are the epsilons with a trained classifier.
+var ValidTurboTestEpsilons = []int{5, 10, 15, 20, 25, 30, 35}
+
+// DefaultTurboTestEpsilon is used when the client does not choose one.
+const DefaultTurboTestEpsilon = 15
+
 // DefaultWebsocketBufferSize is the read and write buffer sizes used when
 // creating a websocket connection. This size is independent of the websocket
 // message sizes defined above (which may be larger) and used to optimize read

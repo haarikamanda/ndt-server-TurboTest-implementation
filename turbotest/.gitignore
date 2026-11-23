@@ -2,3 +2,5 @@ results/**/*.csv.gz
 __pycache__/
 *.onnx
 .pytest_cache/
+results/**/*.log
+results/*.log

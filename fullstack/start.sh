@@ -71,11 +71,10 @@ mkdir -p "${DATA_DIR}"/pcap
 
 
 # Start the NDT server.
-/ndt-server \
+# ndt-server runs in the foreground; the container stops when it exits.
+# (The old "$*" + newline + "&" ran it in the foreground anyway, then hit a
+# syntax error on the lone "&".)
+exec /ndt-server \
  --uuid-prefix-file="${UUID_FILE}" \
  --datadir="${DATA_DIR}" \
- $*
- &
-
-# Any of the backgrounded processes dying should kill the whole thing.
-wait -n
+ "$@"

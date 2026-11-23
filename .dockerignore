@@ -1,0 +1,11 @@
+# Large or root-owned runtime directories must not enter the build context.
+datadir
+resultsdir
+var-local
+local
+localgcs
+certs
+certs-old
+data
+turbotest/results
+**/__pycache__

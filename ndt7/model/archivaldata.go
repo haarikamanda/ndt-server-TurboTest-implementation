@@ -17,6 +17,8 @@ type ArchivalData struct {
 	ClientMeasurements []Measurement
 	ClientMetadata     []metadata.NameValue `json:",omitempty"`
 	ServerMetadata     []metadata.NameValue `json:",omitempty"`
+	// TurboTest holds the early-termination decision, if the client asked for TurboTest.
+	TurboTest *TurboTest `json:",omitempty"`
 }
 
 // The Measurement struct contains measurement results. This structure is
@@ -27,6 +29,9 @@ type Measurement struct {
 	ConnectionInfo *ConnectionInfo `json:",omitempty"`
 	BBRInfo        *BBRInfo        `json:",omitempty"`
 	TCPInfo        *TCPInfo        `json:",omitempty"`
+	// TurboTest is set only in the last measurement of a download that
+	// TurboTest stopped early. It carries the predicted throughput.
+	TurboTest *TurboTest `json:",omitempty"`
 }
 
 // AppInfo contains an application level measurement. This structure is

@@ -25,6 +25,7 @@ import (
 	"github.com/m-lab/ndt-server/ndt7/listener"
 	"github.com/m-lab/ndt-server/ndt7/spec"
 	"github.com/m-lab/ndt-server/platformx"
+	"github.com/m-lab/ndt-server/redis"
 	"github.com/m-lab/ndt-server/version"
 	"github.com/m-lab/tcp-info/eventsocket"
 	"golang.org/x/crypto/acme"
@@ -49,9 +50,14 @@ var (
 	autocertHostname  = flagx.StringFile{}
 	autocertDir       = flag.String("autocert.dir", "autocert", "The directory in which to write autocert files.")
 
-	dataDir          = flag.String("datadir", "/var/spool/ndt", "The directory in which to write data files")
-	htmlDir          = flag.String("htmldir", "html", "The directory from which to serve static web content.")
-	compress         = flag.Bool("compress-results", true, "Whether to compress result files")
+	dataDir  = flag.String("datadir", "/var/spool/ndt", "The directory in which to write data files")
+	htmlDir  = flag.String("htmldir", "html", "The directory from which to serve static web content.")
+	compress = flag.Bool("compress-results", true, "Whether to compress result files")
+
+	turboTestRedisAddr = flag.String("turbotest.redis-addr", os.Getenv("REDIS_ADDR"),
+		"Redis address shared with tcp-info and the TurboTest service (empty disables TurboTest). Defaults to $REDIS_ADDR.")
+	turboTestPoll = flag.Duration("turbotest.poll-interval", 10*time.Millisecond,
+		"How often to read the TurboTest termination flag during a download")
 	deploymentLabels = flagx.KeyValue{}
 	tokenVerifyKey   = flagx.FileBytesArray{}
 	tokenRequired5   bool
@@ -263,13 +269,27 @@ func main() {
 	// The ndt7 listener serving up NDT7 tests, likely on standard ports.
 	ndt7Mux := http.NewServeMux()
 	ndt7Mux.Handle("/", http.FileServer(http.Dir(*htmlDir)))
+	var turboTestRedis *redis.Client
+	if *turboTestRedisAddr != "" {
+		turboTestRedis = redis.NewClient(*turboTestRedisAddr)
+		pctx, pcancel := context.WithTimeout(context.Background(), 2*time.Second)
+		if err := turboTestRedis.Ping(pctx); err != nil {
+			log.Printf("TurboTest: Redis at %s not reachable yet (%v); will retry per test", *turboTestRedisAddr, err)
+		} else {
+			log.Printf("TurboTest: using Redis at %s", *turboTestRedisAddr)
+		}
+		pcancel()
+		defer turboTestRedis.Close()
+	}
 	ndt7Handler := &handler.Handler{
-		DataDir:         *dataDir,
-		SecurePort:      *ndt7Addr,
-		InsecurePort:    *ndt7AddrCleartext,
-		ServerMetadata:  serverMetadata,
-		CompressResults: *compress,
-		Events:          eventSrv,
+		DataDir:               *dataDir,
+		SecurePort:            *ndt7Addr,
+		InsecurePort:          *ndt7AddrCleartext,
+		ServerMetadata:        serverMetadata,
+		CompressResults:       *compress,
+		Events:                eventSrv,
+		RedisClient:           turboTestRedis,
+		TurboTestPollInterval: *turboTestPoll,
 	}
 	ndt7Mux.Handle(spec.DownloadURLPath, http.HandlerFunc(ndt7Handler.Download))
 	ndt7Mux.Handle(spec.UploadURLPath, http.HandlerFunc(ndt7Handler.Upload))
