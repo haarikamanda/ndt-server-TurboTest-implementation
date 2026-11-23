@@ -75,7 +75,7 @@ docker run -d --name turbotest-service --network "$NET" --restart unless-stopped
 echo "waiting for services..."
 for i in $(seq 1 120); do
   if docker logs turbotest-service 2>&1 | grep -q "service ready" &&
-     curl -fsS -o /dev/null "http://$([[ "$NDT_BIND" == 0.0.0.0 ]] && echo 127.0.0.1 || echo "$NDT_BIND"):$NDT_HTTP_PORT/"; then
+     curl -fs -o /dev/null "http://$([[ "$NDT_BIND" == 0.0.0.0 ]] && echo 127.0.0.1 || echo "$NDT_BIND"):$NDT_HTTP_PORT/"; then
     echo "stack is up: ndt7 at ws://localhost:$NDT_HTTP_PORT, Redis at 127.0.0.1:$REDIS_HOST_PORT"
     exit 0
   fi
