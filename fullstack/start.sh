@@ -71,10 +71,14 @@ mkdir -p "${DATA_DIR}"/pcap
 
 
 # Start the NDT server.
-# ndt-server runs in the foreground; the container stops when it exits.
-# (The old "$*" + newline + "&" ran it in the foreground anyway, then hit a
-# syntax error on the lone "&".)
-exec /ndt-server \
+/ndt-server \
  --uuid-prefix-file="${UUID_FILE}" \
  --datadir="${DATA_DIR}" \
- "$@"
+ "$@" &
+
+# If any service (tcp-info, traceroute-caller, packet-headers, ndt-server)
+# exits, stop the container so the restart policy brings the whole stack
+# back; a dead tcp-info would otherwise silently disable TurboTest.
+# Run the container with --init so signals reach every process.
+wait -n
+exit $?

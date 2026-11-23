@@ -53,17 +53,18 @@ fi
 
 # NET_ADMIN only so tests can shape this container's egress with tc (bottleneck tests).
 docker run -d --name ndt-fullstack --network "$NET" --restart unless-stopped \
-  --cap-add NET_ADMIN \
+  --init --cap-add NET_ADMIN \
   -p "$NDT_BIND":"$NDT_HTTP_PORT":18080 -p 127.0.0.1:"$NDT_PROM_PORT":19990 \
   -v turbotest-ndt-data:/var/spool/ndt \
   "${tls_mount[@]}" \
   -e REDIS_ADDR=turbotest-redis:6379 \
+  -e REDIS_SRC_PORTS=18080,14443 \
   ndt-fullstack:custom \
   --ndt7_addr_cleartext=:18080 \
   --prometheusx.listen-address=:19990 \
   "${tls_args[@]}" >/dev/null
 
-docker run -d --name turbotest-service --network "$NET" --restart unless-stopped \
+docker run -d --name turbotest-service --network "$NET" --restart unless-stopped --init \
   -p 127.0.0.1:"$METRICS_HOST_PORT":9994 \
   -v "$MODEL_DIR":/models:ro \
   -v turbotest-onnx-cache:/cache \
@@ -74,7 +75,7 @@ docker run -d --name turbotest-service --network "$NET" --restart unless-stopped
 echo "waiting for services..."
 for i in $(seq 1 120); do
   if docker logs turbotest-service 2>&1 | grep -q "service ready" &&
-     curl -fsS -o /dev/null "http://localhost:$NDT_HTTP_PORT/"; then
+     curl -fsS -o /dev/null "http://$([[ "$NDT_BIND" == 0.0.0.0 ]] && echo 127.0.0.1 || echo "$NDT_BIND"):$NDT_HTTP_PORT/"; then
     echo "stack is up: ndt7 at ws://localhost:$NDT_HTTP_PORT, Redis at 127.0.0.1:$REDIS_HOST_PORT"
     exit 0
   fi

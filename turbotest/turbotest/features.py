@@ -175,6 +175,7 @@ class StreamingFeatureBuilder:
         self.rows: List[np.ndarray] = []      # one row per closed, non-empty bin
         self.bin_index: List[int] = []         # time_bin of each row
         self.n_snapshots = 0
+        self.late_samples = 0  # samples that arrived after their bin was closed by the clock
 
     def add(self, s: Snapshot) -> int:
         """Add one snapshot. Returns the number of rows closed by it (0 or 1)."""
@@ -186,7 +187,9 @@ class StreamingFeatureBuilder:
         if self.bin_index and b <= self.bin_index[-1]:
             # The bin was already closed by the clock (close_until) and a late
             # sample for it arrived. Bins cannot reopen; put it in the next one.
+            # This makes the online features differ from offline: counted.
             b = self.bin_index[-1] + 1
+            self.late_samples += 1
         closed = 0
         if self._cur is not None and b > self._cur.index:
             self._close()

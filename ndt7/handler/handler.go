@@ -55,6 +55,9 @@ type Handler struct {
 	RedisClient *redis.Client
 	// TurboTestPollInterval is how often table_2:<uuid> is read (default 10 ms).
 	TurboTestPollInterval time.Duration
+
+	// turboTest is the shared flag poller, created on first use.
+	turboTest *turboTestPoller
 }
 
 // warnAndClose emits message as a warning and the sends a Bad Request

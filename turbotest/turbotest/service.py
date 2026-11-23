@@ -61,9 +61,12 @@ M_INFER = Histogram("turbotest_inference_batch_seconds", "Stage 1 + Stage 2 batc
                     buckets=(.0005, .001, .002, .005, .01, .02, .05, .1, .25, .5))
 M_SNAPS = Counter("turbotest_snapshots_total", "tcp-info snapshots read from table_1")
 M_BAD_ROWS = Counter("turbotest_bad_rows_total", "table_1 rows that could not be parsed")
+M_LATE = Counter("turbotest_late_samples_total",
+                 "Snapshots that arrived after their 100 ms bin was closed by the clock "
+                 "(online features then differ from offline; raise --clock-close-ms)")
 
 
-@dataclass
+@dataclass(eq=False)  # identity: jobs are compared/collected by object
 class Job:
     uuid: str
     mode: str
@@ -75,6 +78,9 @@ class Job:
     # shadow mode: every loaded epsilon, run on the same snapshots (incl. the primary)
     all_eps: Dict[int, TurboTestSession] = field(default_factory=dict)
     shadow_written: set = field(default_factory=set)
+    # decisions whose Redis write failed; written again next cycle
+    unwritten: bool = False
+    late_seen: int = 0
 
     def sessions(self) -> List[TurboTestSession]:
         return list(self.all_eps.values()) if self.all_eps else [self.session]
@@ -83,35 +89,49 @@ class Job:
 class Service:
     def __init__(self, r: redis.Redis, models: TurboTestModels, poll_ms: float = 5.0,
                  max_test_s: float = 16.0, key_ttl_s: int = 300, clock_close_ms: float = 50.0,
-                 max_jobs: int = 5000):
+                 max_jobs: int = 5000, max_job_age_s: float = 5.0):
         self.r = r
         self.models = models
         self.poll_s = poll_ms / 1e3
         self.max_test_ns = int(max_test_s * 1e9)
         self.ttl = key_ttl_s
         self.clock_margin_ns = int(clock_close_ms * 1e6)
-        self.max_jobs = max_jobs
+        self.max_jobs = max_jobs  # counted in sessions (a shadow job runs one per epsilon)
+        self.max_job_age_ns = int(max_job_age_s * 1e9)
         self.jobs: Dict[str, Job] = {}
         self.running = True
         self.n_decisions = 0
         self.n_jobs = 0
 
     # ---- job intake -------------------------------------------------------
+    def _n_sessions(self) -> int:
+        return sum(len(jb.sessions()) for jb in self.jobs.values())
+
     def _accept_jobs(self) -> None:
         raw = self.r.lpop(QUEUE_KEY, 64)
+        now = time.time_ns()
+        n_sessions = self._n_sessions()
         for item in raw or []:
             try:
                 j = json.loads(item)
                 uuid = str(j["uuid"])
+                enq = int(j.get("enqueued_ns") or now)
             except Exception:
                 log.warning("bad job %r", item)
                 M_REJECTED.labels("bad_job").inc()
                 continue
             if uuid in self.jobs:
                 continue
-            if len(self.jobs) >= self.max_jobs:
-                # Bounded memory: the test then simply runs to completion.
-                log.warning("max jobs (%d) reached; not following %s", self.max_jobs, uuid)
+            if now - enq > self.max_job_age_ns:
+                # Queued while the service was down or behind: its download has
+                # already gone on without TurboTest (or is nearly over).
+                M_REJECTED.labels("stale").inc()
+                continue
+            mode = j.get("mode", "enforce")
+            need = len(self.models.classifiers) if mode == "shadow" else 1
+            if n_sessions + need > self.max_jobs:
+                # Bounded memory/CPU: the test then simply runs to completion.
+                log.warning("max sessions (%d) reached; not following %s", self.max_jobs, uuid)
                 M_REJECTED.labels("max_jobs").inc()
                 continue
             try:
@@ -119,71 +139,75 @@ class Service:
             except (TypeError, ValueError):
                 eps = self.models.epsilon
             sess = TurboTestSession(self.models, eps, deferred=True)
-            mode = j.get("mode", "enforce")
-            jb = Job(uuid, mode, time.time_ns(), sess)
+            jb = Job(uuid, mode, enq, sess)
             if mode == "shadow":
                 # Evaluate every classifier on the same test: one full-length
                 # test then gives the stop point and error of each epsilon.
                 jb.all_eps = {e: (sess if e == sess.epsilon else TurboTestSession(self.models, e, deferred=True))
                               for e in sorted(self.models.classifiers)}
             self.jobs[uuid] = jb
+            n_sessions += need
             self.n_jobs += 1
             M_JOBS.labels(mode).inc()
-            log.info("job %s mode=%s epsilon=%d", uuid, j.get("mode"), sess.epsilon)
+            log.info("job %s mode=%s epsilon=%d", uuid, mode, sess.epsilon)
+
+    def _drop(self, jb: Job, why: str) -> None:
+        """Stop following one test (its download then runs to full length)."""
+        M_ERRORS.labels(why).inc()
+        log.exception("dropping job %s (%s)", jb.uuid, why)
+        jb.finished = True
+        self.jobs.pop(jb.uuid, None)
 
     # ---- one poll cycle ---------------------------------------------------
     def step(self) -> None:
         self._accept_jobs()
         if not self.jobs:
+            M_ACTIVE.set(0)
             return
         jobs = list(self.jobs.values())
         pipe = self.r.pipeline(transaction=False)
         for jb in jobs:
             pipe.lrange(T1 + jb.uuid, jb.offset, -1)
             pipe.exists(DONE + jb.uuid)
-        res = pipe.execute()
+        # Per-key errors (e.g. WRONGTYPE) come back as values, not exceptions,
+        # so one bad key cannot stall every test.
+        res = pipe.execute(raise_on_error=False)
         now_ns = time.time_ns()
         writes = self.r.pipeline(transaction=False)
-        any_write = False
+        written: List[Job] = []
+        # 0) Decisions whose write failed last cycle.
+        for jb in jobs:
+            if jb.unwritten:
+                self._write_all_decisions(writes, jb)
+                written.append(jb)
         # 1) Ingest new snapshots; sessions only mark which taus are due.
         done_flags = {}
         for i, jb in enumerate(jobs):
             rows, done = res[2 * i], res[2 * i + 1]
+            if isinstance(rows, Exception) or isinstance(done, Exception):
+                M_ERRORS.labels("redis_key").inc()
+                rows = [] if isinstance(rows, Exception) else rows
+                done = 0 if isinstance(done, Exception) else done
             done_flags[jb.uuid] = done
-            jb.offset += len(rows)
-            sessions = jb.sessions()
-            M_SNAPS.inc(len(rows))
-            for row in rows:
-                try:
-                    snap = Snapshot.parse(row.decode() if isinstance(row, bytes) else row)
-                except (ValueError, UnicodeDecodeError):
-                    M_BAD_ROWS.inc()
-                    continue
-                for sess in sessions:
-                    sess.add(snap)
-            for sess in sessions:
-                if sess.features.n_snapshots:
-                    sess.tick(now_ns, self.clock_margin_ns)
+            try:
+                self._ingest(jb, rows, now_ns)
+            except Exception:
+                self._drop(jb, "ingest")
+        jobs = [jb for jb in jobs if not jb.finished]
         # 2) Stage 1 + Stage 2 for every due test, batched across tests.
         t0 = time.perf_counter()
-        owner = {}
-        all_sessions = []
-        for jb in jobs:
-            for sess in jb.sessions():
-                owner[id(sess)] = jb
-                all_sessions.append(sess)
-        decided = run_batched(self.models, all_sessions)
+        decided = self._infer(jobs)
         batch_ms = (time.perf_counter() - t0) * 1e3
-        if any(x.timings_ms and x.timings_ms[-1][0] for x in all_sessions):
+        if decided is not None:
             M_INFER.observe(batch_ms / 1e3)
-        for sess, d in decided:
-            jb = owner[id(sess)]
+        for jb, sess, d in decided or []:
             if sess is jb.session:
                 jb.infer_ms.append(batch_ms)
                 self._write_decision(writes, jb, d, batch_ms)
             if jb.all_eps:
                 self._write_shadow(writes, jb, sess, d)
-            any_write = True
+            if jb not in written:
+                written.append(jb)
         # 3) Retire finished tests. A shadow job stays until the download ends
         #    (or every classifier decided), so all epsilons get evaluated.
         for jb in jobs:
@@ -202,14 +226,75 @@ class Service:
             for sess in jb.all_eps.values():
                 if sess.decision is None:
                     self._write_shadow(writes, jb, sess, None)
-            any_write = True
+            if jb not in written:
+                written.append(jb)
             jb.finished = True
-        if any_write:
-            writes.execute()
+        if written:
+            try:
+                writes.execute()
+                for jb in written:
+                    jb.unwritten = False
+            except redis.exceptions.RedisError:
+                # Keep the jobs and write their decisions again next cycle;
+                # a lost table_2=1 would let the test run to full length.
+                for jb in written:
+                    jb.unwritten = True
+                    jb.finished = False
+                    jb.shadow_written.clear()
+                raise
         for jb in jobs:
             if jb.finished:
                 self.jobs.pop(jb.uuid, None)
         M_ACTIVE.set(len(self.jobs))
+
+    def _ingest(self, jb: Job, rows, now_ns: int) -> None:
+        jb.offset += len(rows)
+        sessions = jb.sessions()
+        M_SNAPS.inc(len(rows))
+        for row in rows:
+            try:
+                snap = Snapshot.parse(row.decode() if isinstance(row, bytes) else row)
+            except (ValueError, UnicodeDecodeError):
+                M_BAD_ROWS.inc()
+                continue
+            for sess in sessions:
+                sess.add(snap)
+        for sess in sessions:
+            if sess.features.n_snapshots:
+                sess.tick(now_ns, self.clock_margin_ns)
+        late = jb.session.features.late_samples
+        if late > jb.late_seen:
+            M_LATE.inc(late - jb.late_seen)
+            jb.late_seen = late
+
+    def _infer(self, jobs: List[Job]):
+        """Batched Stage 1/2; on an error, retry per job and drop only the bad ones."""
+        owner = {}
+        sessions = []
+        for jb in jobs:
+            for sess in jb.sessions():
+                owner[id(sess)] = jb
+                sessions.append(sess)
+        if not any(s.pending for s in sessions):
+            return None
+        try:
+            return [(owner[id(s)], s, d) for s, d in run_batched(self.models, sessions)]
+        except Exception:
+            log.exception("batched inference failed; retrying per test")
+        out = []
+        for jb in jobs:
+            try:
+                out += [(jb, s, d) for s, d in run_batched(self.models, jb.sessions())]
+            except Exception:
+                self._drop(jb, "inference")
+        return out
+
+    def _write_all_decisions(self, pipe, jb: Job) -> None:
+        if jb.session.decision is not None:
+            self._write_decision(pipe, jb, jb.session.decision)
+        for sess in jb.all_eps.values():
+            if sess.decision is not None:
+                self._write_shadow(pipe, jb, sess, sess.decision)
 
     def _write_decision(self, pipe, jb: Job, d, batch_ms: float = 0.0) -> None:
         now = time.time_ns()
@@ -236,8 +321,9 @@ class Service:
         pipe.hset(RESULT + jb.uuid, mapping=fields)
         pipe.expire(RESULT + jb.uuid, self.ttl)
         pipe.set(T2 + jb.uuid, 1, ex=self.ttl)
-        self.n_decisions += 1
-        M_DECISIONS.labels("stop", str(s.epsilon)).inc()
+        if not jb.unwritten:
+            self.n_decisions += 1
+            M_DECISIONS.labels("stop", str(s.epsilon)).inc()
         log.info("STOP %s tau=%d (%.0f ms) pred=%.2f Mbit/s p=%.3f", jb.uuid, d.tau, d.elapsed_ms,
                  d.predicted_bps / 1e6, d.probability)
 
@@ -275,11 +361,11 @@ class Service:
                 log.warning("redis: %s", e)
                 time.sleep(0.5)
             except Exception:
-                # Never let one bad test stop the service: drop all current
-                # jobs (their downloads then run to full length) and go on.
+                # Per-test errors are handled inside step(); this is a last
+                # resort so the loop itself never dies.
                 M_ERRORS.labels("internal").inc()
-                log.exception("service step failed; dropping %d active jobs", len(self.jobs))
-                self.jobs.clear()
+                log.exception("service step failed")
+                time.sleep(0.1)
             dt = time.perf_counter() - t0
             M_STEP.observe(dt)
             if dt < self.poll_s:
@@ -301,7 +387,12 @@ def main() -> None:
     ap.add_argument("--log-level", default=os.environ.get("TURBOTEST_LOG_LEVEL", "INFO"))
     ap.add_argument("--metrics-port", type=int, default=int(os.environ.get("TURBOTEST_METRICS_PORT", "9994")),
                     help="Prometheus /metrics port (0 disables)")
-    ap.add_argument("--max-jobs", type=int, default=int(os.environ.get("TURBOTEST_MAX_JOBS", "5000")))
+    ap.add_argument("--max-jobs", type=int, default=int(os.environ.get("TURBOTEST_MAX_JOBS", "5000")),
+                    help="max concurrent sessions (a shadow test uses one per epsilon)")
+    ap.add_argument("--max-job-age-s", type=float, default=float(os.environ.get("TURBOTEST_MAX_JOB_AGE_S", "5")),
+                    help="drop queued jobs older than this (queued while the service was down)")
+    ap.add_argument("--clock-close-ms", type=float, default=float(os.environ.get("TURBOTEST_CLOCK_CLOSE_MS", "50")),
+                    help="close a 100 ms bin this long after its window if no later snapshot came")
     a = ap.parse_args()
     logging.basicConfig(level=a.log_level, format="%(asctime)s %(levelname)s %(message)s")
 
@@ -332,7 +423,8 @@ def main() -> None:
         c.prob(classifier_input(m, 5, {5: p}))
     log.info("models loaded in %.1fs (epsilons %s)", time.time() - t0, sorted(models.classifiers))
 
-    svc = Service(r, models, poll_ms=a.poll_ms, max_jobs=a.max_jobs)
+    svc = Service(r, models, poll_ms=a.poll_ms, max_jobs=a.max_jobs, max_job_age_s=a.max_job_age_s,
+                  clock_close_ms=a.clock_close_ms)
 
     def stop(*_):
         svc.running = False

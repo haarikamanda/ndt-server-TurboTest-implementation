@@ -24,10 +24,17 @@ const (
 	turboTestKeyTTL = 5 * time.Minute
 )
 
+// maxQueueLen bounds turbotest:queue if the service is down; older jobs are
+// dropped (those tests simply run to full length).
+const maxQueueLen = 10000
+
 type turboTestJob struct {
 	UUID    string `json:"uuid"`
 	Mode    string `json:"mode"`
 	Epsilon int    `json:"epsilon"`
+	// EnqueuedNs lets the service drop jobs that waited too long (e.g.
+	// queued while the service was down).
+	EnqueuedNs int64 `json:"enqueued_ns"`
 }
 
 // Ping checks the connection.
@@ -38,7 +45,7 @@ func (c *Client) Ping(ctx context.Context) error {
 // RegisterTurboTest sets table_2:<uuid> = 0 and queues the test for the
 // TurboTest service.
 func (c *Client) RegisterTurboTest(ctx context.Context, uuid, mode string, epsilon int) error {
-	job, err := json.Marshal(turboTestJob{UUID: uuid, Mode: mode, Epsilon: epsilon})
+	job, err := json.Marshal(turboTestJob{UUID: uuid, Mode: mode, Epsilon: epsilon, EnqueuedNs: time.Now().UnixNano()})
 	if err != nil {
 		return err
 	}
@@ -46,8 +53,29 @@ func (c *Client) RegisterTurboTest(ctx context.Context, uuid, mode string, epsil
 	pipe.Set(ctx, table2Prefix+uuid, 0, turboTestKeyTTL)
 	pipe.Del(ctx, resultPrefix+uuid, donePrefix+uuid)
 	pipe.RPush(ctx, turboTestQueue, job)
+	pipe.LTrim(ctx, turboTestQueue, -maxQueueLen, -1)
 	_, err = pipe.Exec(ctx)
 	return err
+}
+
+// GetTerminationFlags reads table_2 for many tests in one round trip.
+// The result has one entry per uuid: true if the flag is "1".
+func (c *Client) GetTerminationFlags(ctx context.Context, uuids []string) ([]bool, error) {
+	keys := make([]string, len(uuids))
+	for i, u := range uuids {
+		keys[i] = table2Prefix + u
+	}
+	vals, err := c.rdb.MGet(ctx, keys...).Result()
+	if err != nil {
+		return nil, err
+	}
+	out := make([]bool, len(uuids))
+	for i, v := range vals {
+		if s, ok := v.(string); ok && s == "1" {
+			out[i] = true
+		}
+	}
+	return out, nil
 }
 
 // MarkTurboTestDone tells the service that the download has ended.

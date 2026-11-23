@@ -3,6 +3,7 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/url"
 	"testing"
 	"time"
@@ -68,7 +69,10 @@ func Test_turboTestEnforce(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("stop channel not closed")
 	}
-	res := sp.TurboTestResult()
+	if run.result().TerminatedEarly {
+		t.Fatal("TerminatedEarly must be set only when the sender stops")
+	}
+	res := sp.TurboTestResult() // what the sender calls when it stops
 	if res.Decision != "stop" || res.Tau != 15 || res.PredictedMbps != 93.5 || !res.TerminatedEarly {
 		t.Fatalf("bad result %+v", res)
 	}
@@ -109,5 +113,52 @@ func Test_turboTestNoDecision(t *testing.T) {
 	h2 := &Handler{}
 	if h2.startTurboTest(context.Background(), "u4", &turboTestParams{"enforce", 15}, &sender.Params{}) != nil {
 		t.Fatal("without Redis, startTurboTest must return nil")
+	}
+}
+
+// A failing Redis opens the breaker: further tests skip TurboTest at once.
+func Test_turboTestBreaker(t *testing.T) {
+	h, mr := newTestHandler(t)
+	mr.Close()
+	for i := 0; i < breakerThreshold; i++ {
+		if h.startTurboTest(context.Background(), "x", &turboTestParams{"enforce", 15}, &sender.Params{}) != nil {
+			t.Fatal("register must fail with Redis down")
+		}
+	}
+	t0 := time.Now()
+	if h.startTurboTest(context.Background(), "y", &turboTestParams{"enforce", 15}, &sender.Params{}) != nil {
+		t.Fatal("breaker should be open")
+	}
+	if time.Since(t0) > 50*time.Millisecond {
+		t.Fatal("open breaker must not wait on Redis")
+	}
+}
+
+// Many concurrent downloads share one poller; each sees only its own flag.
+func Test_turboTestSharedPoller(t *testing.T) {
+	h, mr := newTestHandler(t)
+	var runs []*turboTestRun
+	var params []*sender.Params
+	for i := 0; i < 50; i++ {
+		sp := &sender.Params{}
+		runs = append(runs, h.startTurboTest(context.Background(), fmt.Sprintf("c%d", i), &turboTestParams{"enforce", 15}, sp))
+		params = append(params, sp)
+	}
+	mr.Set("table_2:c7", "1")
+	select {
+	case <-params[7].TurboTestStop:
+	case <-time.After(2 * time.Second):
+		t.Fatal("c7 not stopped")
+	}
+	select {
+	case <-params[8].TurboTestStop:
+		t.Fatal("c8 stopped without a flag")
+	case <-time.After(50 * time.Millisecond):
+	}
+	for _, r := range runs {
+		r.finish()
+	}
+	if n := len(h.poller().waiters); n != 0 {
+		t.Fatalf("%d waiters leaked", n)
 	}
 }

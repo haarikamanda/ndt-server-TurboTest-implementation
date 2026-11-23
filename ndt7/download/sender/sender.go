@@ -24,8 +24,9 @@ type Params struct {
 	// TurboTestStop, when closed, ends the download early (TurboTest
 	// "enforce" mode). A nil channel never fires.
 	TurboTestStop <-chan struct{}
-	// TurboTestResult returns the decision sent to the client in the last
-	// measurement before the connection is closed. It may be nil.
+	// TurboTestResult is called when the sender stops because of
+	// TurboTestStop; it returns the decision sent to the client in the last
+	// message before the connection is closed. It may be nil.
 	TurboTestResult func() *model.TurboTest
 }
 
@@ -114,6 +115,10 @@ func Start(ctx context.Context, conn *websocket.Conn, data *model.ArchivalData, 
 		case <-params.TurboTestStop:
 			// TurboTest decided that enough data was collected. Tell the
 			// client the predicted throughput, then close like early_exit.
+			// The message is not appended to data.ServerMeasurements: the
+			// last archived measurement must keep its TCPInfo (rate
+			// computations read it); the decision is archived in
+			// data.TurboTest instead.
 			final := model.Measurement{}
 			if params.TurboTestResult != nil {
 				final.TurboTest = params.TurboTestResult()
@@ -121,7 +126,6 @@ func Start(ctx context.Context, conn *websocket.Conn, data *model.ArchivalData, 
 			if err := conn.WriteJSON(final); err != nil {
 				logging.Logger.WithError(err).Warn("sender: conn.WriteJSON (turbotest) failed")
 			}
-			data.ServerMeasurements = append(data.ServerMeasurements, final)
 			closer.StartClosing(conn)
 			ndt7metrics.ClientSenderErrors.WithLabelValues(
 				proto, string(spec.SubtestDownload), "turbotest-closed-early").Inc()
