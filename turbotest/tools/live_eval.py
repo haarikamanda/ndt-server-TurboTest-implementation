@@ -56,12 +56,9 @@ CONDITIONS = {
 # Shaping is HTB + AQM on the downstream veth, latency is netem on the upstream
 # side, and CTP replays real cross traffic through the same bottleneck.
 NETFORGE_CONDITIONS = {
-    "nf_25M_30ms_fqcodel": (25, 10, 30, "fq_codel", None),
-    "nf_50M_60ms_pfifo": (50, 20, 60, "pfifo limit 1000", None),
-    "nf_100M_20ms_fqcodel": (100, 20, 20, "fq_codel", None),
-    "nf_100M_20ms_ctp": (100, 20, 20, "fq_codel", "on_70_profile8.pcap"),
-    "nf_300M_15ms_fqcodel": (300, 50, 15, "fq_codel", None),
-    "nf_40M_100ms_ctp": (40, 10, 100, "fq_codel", "on_70_profile8.pcap"),
+    # Rate sweep; everything else fixed: fq_codel (Linux default qdisc),
+    # 20 ms base latency, 20 Mbit/s upload (ACKs only), no cross traffic.
+    f"nf_{r}M": (r, 20, 20, "fq_codel", None) for r in (10, 20, 50, 100, 200, 300, 400)
 }
 
 
