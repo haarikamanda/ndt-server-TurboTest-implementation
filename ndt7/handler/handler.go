@@ -50,8 +50,14 @@ type Handler struct {
 	CompressResults bool
 	// Events is for reporting new connections to the event server.
 	Events eventsocket.Server
-	// RedisClient is the Redis client for caching.
+	// RedisClient connects to the Redis server shared with tcp-info and the
+	// TurboTest service. If nil, TurboTest requests run as normal tests.
 	RedisClient *redis.Client
+	// TurboTestPollInterval is how often table_2:<uuid> is read (default 10 ms).
+	TurboTestPollInterval time.Duration
+
+	// turboTest is the shared flag poller, created on first use.
+	turboTest *turboTestPoller
 }
 
 // warnAndClose emits message as a warning and the sends a Bad Request
@@ -77,6 +83,11 @@ func (h *Handler) Upload(rw http.ResponseWriter, req *http.Request) {
 func (h *Handler) runMeasurement(kind spec.SubtestKind, rw http.ResponseWriter, req *http.Request) {
 	// Validate client request before opening the connection.
 	params, err := validateEarlyExit(req.URL.Query())
+	if err != nil {
+		warnAndClose(rw, err.Error())
+		return
+	}
+	ttParams, err := validateTurboTest(req.URL.Query())
 	if err != nil {
 		warnAndClose(rw, err.Error())
 		return
@@ -129,7 +140,14 @@ func (h *Handler) runMeasurement(kind spec.SubtestKind, rw http.ResponseWriter, 
 	var rate float64
 	if kind == spec.SubtestDownload {
 		result.Download = data
+		var tt *turboTestRun
+		if ttParams != nil {
+			tt = h.startTurboTest(ctx, data.UUID, ttParams, params)
+		}
 		err = download.Do(ctx, conn, data, params)
+		if tt != nil {
+			data.TurboTest = tt.finish()
+		}
 		rate = downRate(data.ServerMeasurements)
 	} else if kind == spec.SubtestUpload {
 		result.Upload = data
@@ -288,39 +306,4 @@ func validateEarlyExit(values url.Values) (*sender.Params, error) {
 	return &sender.Params{
 		IsEarlyExit: false,
 	}, nil
-}
-
-// checkEarlyTermination queries in-memory database for termination decision every 100 ms.
-// It monitors the termination flag for the given UUID and calls the cancel function
-// when early termination is requested.
-//
-//	0 is proceed (do not terminate early), 1 is terminate early
-//	keys are prefixed by "table_2"
-//	key: "table_2:uuid"
-func (h *Handler) checkEarlyTermination(ctx context.Context, uuid string, cancel context.CancelFunc) {
-	ticker := time.NewTicker(100 * time.Millisecond)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			// Context cancelled, stop monitoring
-			return
-		case <-ticker.C:
-			// Query table_2 for termination decision
-			flag, err := h.RedisClient.GetTerminationFlag(ctx, uuid)
-			if err != nil {
-				// Log error but continue monitoring
-				logging.Logger.WithError(err).Warn("checkEarlyTermination: failed to get termination flag")
-				continue
-			}
-
-			// If flag == 1, trigger early termination
-			if flag == 1 {
-				logging.Logger.Debug("checkEarlyTermination: termination flag set, cancelling context")
-				cancel()
-				return
-			}
-		}
-	}
 }

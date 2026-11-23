@@ -45,6 +45,7 @@ mkdir -p "${DATA_DIR}"/tcpinfo
   --output="${DATA_DIR}"/tcpinfo \
   --tcpinfo.eventsocket=/var/local/tcpeventsocket.sock \
   &
+TCPINFO_PID=$!
 
 echo "Waiting for the tcpinfo eventsocket to become available..."
 while ! socat -u OPEN:/dev/null UNIX-CONNECT:/var/local/tcpeventsocket.sock; do
@@ -53,9 +54,10 @@ done
 
 # Start the traceroute service.
 mkdir -p "${DATA_DIR}"/traceroute
+# (This traceroute-caller version has no --uuid-prefix-file flag; with it,
+# the process exited at start.)
 /traceroute-caller \
   --prometheusx.listen-address=:9992 \
-  --uuid-prefix-file="${UUID_FILE}" \
   --hopannotation-output="${DATA_DIR}"/hopannotation1 \
   --traceroute-output="${DATA_DIR}"/scamper1 \
   --tcpinfo.eventsocket=/var/local/tcpeventsocket.sock \
@@ -74,8 +76,15 @@ mkdir -p "${DATA_DIR}"/pcap
 /ndt-server \
  --uuid-prefix-file="${UUID_FILE}" \
  --datadir="${DATA_DIR}" \
- $*
- &
+ "$@" &
+NDT_PID=$!
 
-# Any of the backgrounded processes dying should kill the whole thing.
-wait -n
+# If tcp-info or ndt-server exits, stop the container so the restart policy
+# brings the stack back (a dead tcp-info would otherwise silently disable
+# TurboTest). traceroute-caller and packet-headers are best effort: their
+# failure must not stop speed tests. Run the container with --init.
+set +e
+wait -n "$TCPINFO_PID" "$NDT_PID"
+rc=$?
+echo "a critical process exited (rc=$rc); stopping the container" >&2
+exit "$rc"

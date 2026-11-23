@@ -1,3 +1,12 @@
+# Stage 0: build the TurboTest-enabled ndt-server from this repository.
+FROM golang:1.22 AS ndt-server-build
+WORKDIR /go/src/github.com/m-lab/ndt-server
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN go install -tags netgo \
+      -ldflags "-X github.com/m-lab/ndt-server/version.Version=turbotest -extldflags -static" .
+
 # Traceroute-caller is the most brittle of our tools, as it requires
 # scamper which is not statically linked.  So we work within that image.
 FROM measurementlab/traceroute-caller
@@ -17,7 +26,7 @@ COPY --from=tcp-info-custom /licences/zstd/ /licences/zstd/
 ENV DEBIAN_FRONTEND=noninteractive
 # RUN apt-get update && apt-get install -y libpcap-dev golang-go git socat
 # Install dependencies
-RUN apt-get update && apt-get install -y libpcap-dev git socat wget
+RUN apt-get update && apt-get install -y libpcap-dev git socat wget iproute2
 
 # Download and install Go 1.20
 RUN wget https://go.dev/dl/go1.20.13.linux-amd64.tar.gz && \
@@ -32,8 +41,10 @@ RUN go install github.com/m-lab/packet-headers@latest
 RUN mv /root/go/bin/packet-headers /packet-headers
 
 # The NDT server needs the server binary and its HTML files
-COPY --from=measurementlab/ndt-server /ndt-server /
-COPY --from=measurementlab/ndt-server /html /html
+# Build ndt-server from this repository (the TurboTest-enabled code), not the
+# stock measurementlab/ndt-server image.
+COPY --from=ndt-server-build /go/bin/ndt-server /ndt-server
+COPY --from=ndt-server-build /go/src/github.com/m-lab/ndt-server/html /html
 
 COPY fullstack/start.sh /start.sh
 RUN chmod +x /start.sh

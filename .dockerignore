@@ -1,0 +1,13 @@
+# Large or root-owned runtime directories must not enter the build context.
+datadir
+resultsdir
+var-local
+local
+localgcs
+certs
+certs-old
+turbotest/results
+**/__pycache__
+# Separate Go modules with their own images.
+tcp-info
+ndt7-client
