@@ -169,7 +169,11 @@ def main():
         export_onnx(Classifier.checkpoint_path(md, e))
     t0 = time.time()
     prepared = []
-    with ProcessPoolExecutor(a.workers, initializer=_init, initargs=(md, ref, epsilons)) as ex:
+    # spawn, not fork: the parent may have initialized torch/OpenMP threads
+    # (ONNX export), and forking after that can deadlock the workers.
+    import multiprocessing as mp
+    with ProcessPoolExecutor(a.workers, mp_context=mp.get_context("spawn"), initializer=_init,
+                             initargs=(md, ref, epsilons)) as ex:
         for i, r in enumerate(ex.map(_prepare, files, chunksize=64)):
             if r is not None:
                 prepared.append(r)
