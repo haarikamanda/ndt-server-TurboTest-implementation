@@ -6,6 +6,5 @@ local
 localgcs
 certs
 certs-old
-data
 turbotest/results
 **/__pycache__
