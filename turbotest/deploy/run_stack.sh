@@ -18,6 +18,7 @@ set -euo pipefail
 
 NET=${NET:-ndt-net}
 NDT_HTTP_PORT=${NDT_HTTP_PORT:-18080}       # ndt7 cleartext (ws://)
+NDT_BIND=${NDT_BIND:-127.0.0.1}             # set NDT_BIND=0.0.0.0 to serve remote clients
 NDT_PROM_PORT=${NDT_PROM_PORT:-19990}
 REDIS_HOST_PORT=${REDIS_HOST_PORT:-16379}   # bound to 127.0.0.1 only
 METRICS_HOST_PORT=${METRICS_HOST_PORT:-19994}
@@ -46,14 +47,14 @@ docker run -d --name turbotest-redis --network "$NET" --restart unless-stopped \
 tls_args=()
 tls_mount=()
 if [[ -n "$CERT_DIR" ]]; then
-  tls_mount=(-v "$(cd "$CERT_DIR" && pwd -P)":/certs:ro -p 14443:14443)
+  tls_mount=(-v "$(cd "$CERT_DIR" && pwd -P)":/certs:ro -p "$NDT_BIND":14443:14443)
   tls_args=(--cert=/certs/cert.pem --key=/certs/key.pem --ndt7_addr=:14443)
 fi
 
 # NET_ADMIN only so tests can shape this container's egress with tc (bottleneck tests).
 docker run -d --name ndt-fullstack --network "$NET" --restart unless-stopped \
   --cap-add NET_ADMIN \
-  -p "$NDT_HTTP_PORT":18080 -p 127.0.0.1:"$NDT_PROM_PORT":19990 \
+  -p "$NDT_BIND":"$NDT_HTTP_PORT":18080 -p 127.0.0.1:"$NDT_PROM_PORT":19990 \
   -v turbotest-ndt-data:/var/spool/ndt \
   "${tls_mount[@]}" \
   -e REDIS_ADDR=turbotest-redis:6379 \
