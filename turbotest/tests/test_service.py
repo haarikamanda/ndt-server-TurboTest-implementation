@@ -65,7 +65,8 @@ def _rows(path, n=1200):
 def test_job_produces_consistent_outputs(rds, service, eps):
     path = sorted(glob.glob(os.path.join(HERE, "data", "*.csv.gz")))[0]
     uuid = f"test-{eps}"
-    rds.delete(f"table_1:{uuid}", f"table_2:{uuid}", f"turbotest:result:{uuid}", f"turbotest:done:{uuid}")
+    rds.delete(f"table_1:{uuid}", f"table_2:{uuid}", f"turbotest:result:{uuid}", f"turbotest:done:{uuid}",
+               f"turbotest:shadow:{uuid}")
     rds.set(f"table_2:{uuid}", 0)
     rds.rpush("turbotest:queue", json.dumps({"uuid": uuid, "mode": "shadow", "epsilon": eps}))
     rows = _rows(path)
@@ -83,3 +84,8 @@ def test_job_produces_consistent_outputs(rds, service, eps):
     if res["status"] == "stop":
         assert int(res["tau"]) % 5 == 0 and float(res["predicted_mbps"]) >= 0
     assert uuid not in service.jobs
+    shadow = {int(k): json.loads(v) for k, v in rds.hgetall(f"turbotest:shadow:{uuid}").items()}
+    assert sorted(shadow) == sorted(service.models.classifiers)
+    assert shadow[eps]["decision"] == res["status"]
+    if res["status"] == "stop":
+        assert shadow[eps]["tau"] == int(res["tau"])

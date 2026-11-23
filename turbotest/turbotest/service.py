@@ -14,6 +14,8 @@ Redis protocol (shared with ndt-server and tcp-info):
                                     decided_at_ns, ...) written together with table_2.
   turbotest:done:<uuid>      STRING ndt-server sets it when the download ends; the
                                     service then drops the session.
+  turbotest:shadow:<uuid>    HASH   shadow mode only: field <epsilon> = JSON decision of
+                                    every loaded classifier on the same test.
 
 One loop serves all tests: every --poll-ms it fetches the new table_1 rows of
 every active test with a single pipelined round trip, advances each test's
@@ -44,6 +46,7 @@ T1 = "table_1:"
 T2 = "table_2:"
 RESULT = "turbotest:result:"
 DONE = "turbotest:done:"
+SHADOW = "turbotest:shadow:"
 STATS_KEY = "turbotest:stats"
 
 
@@ -56,6 +59,12 @@ class Job:
     offset: int = 0                 # next table_1 index to read
     finished: bool = False
     infer_ms: List[float] = field(default_factory=list)
+    # shadow mode: every loaded epsilon, run on the same snapshots (incl. the primary)
+    all_eps: Dict[int, TurboTestSession] = field(default_factory=dict)
+    shadow_written: set = field(default_factory=set)
+
+    def sessions(self) -> List[TurboTestSession]:
+        return list(self.all_eps.values()) if self.all_eps else [self.session]
 
 
 class Service:
@@ -89,7 +98,14 @@ class Service:
             except (TypeError, ValueError):
                 eps = self.models.epsilon
             sess = TurboTestSession(self.models, eps, deferred=True)
-            self.jobs[uuid] = Job(uuid, j.get("mode", "enforce"), time.time_ns(), sess)
+            mode = j.get("mode", "enforce")
+            jb = Job(uuid, mode, time.time_ns(), sess)
+            if mode == "shadow":
+                # Evaluate every classifier on the same test: one full-length
+                # test then gives the stop point and error of each epsilon.
+                jb.all_eps = {e: (sess if e == sess.epsilon else TurboTestSession(self.models, e, deferred=True))
+                              for e in sorted(self.models.classifiers)}
+            self.jobs[uuid] = jb
             self.n_jobs += 1
             log.info("job %s mode=%s epsilon=%d", uuid, j.get("mode"), sess.epsilon)
 
@@ -113,33 +129,54 @@ class Service:
             rows, done = res[2 * i], res[2 * i + 1]
             done_flags[jb.uuid] = done
             jb.offset += len(rows)
+            sessions = jb.sessions()
             for row in rows:
                 try:
-                    jb.session.add(Snapshot.parse(row.decode() if isinstance(row, bytes) else row))
+                    snap = Snapshot.parse(row.decode() if isinstance(row, bytes) else row)
                 except ValueError:
                     continue
-            if jb.session.features.n_snapshots:
-                jb.session.tick(now_ns, self.clock_margin_ns)
+                for sess in sessions:
+                    sess.add(snap)
+            for sess in sessions:
+                if sess.features.n_snapshots:
+                    sess.tick(now_ns, self.clock_margin_ns)
         # 2) Stage 1 + Stage 2 for every due test, batched across tests.
         t0 = time.perf_counter()
-        decided = run_batched(self.models, [jb.session for jb in jobs])
+        owner = {}
+        all_sessions = []
+        for jb in jobs:
+            for sess in jb.sessions():
+                owner[id(sess)] = jb
+                all_sessions.append(sess)
+        decided = run_batched(self.models, all_sessions)
         batch_ms = (time.perf_counter() - t0) * 1e3
-        by_session = {id(jb.session): jb for jb in jobs}
         for sess, d in decided:
-            jb = by_session[id(sess)]
-            jb.infer_ms.append(batch_ms)
-            self._write_decision(writes, jb, d, batch_ms)
+            jb = owner[id(sess)]
+            if sess is jb.session:
+                jb.infer_ms.append(batch_ms)
+                self._write_decision(writes, jb, d, batch_ms)
+            if jb.all_eps:
+                self._write_shadow(writes, jb, sess, d)
             any_write = True
-        # 3) Retire finished tests.
+        # 3) Retire finished tests. A shadow job stays until the download ends
+        #    (or every classifier decided), so all epsilons get evaluated.
         for jb in jobs:
             done = done_flags[jb.uuid]
-            age = now_ns - jb.registered_ns
-            if done or jb.session.decision is not None or age > self.max_test_ns:
-                if jb.session.decision is None:
-                    writes.hset(RESULT + jb.uuid, mapping=self._no_stop_fields(jb))
-                    writes.expire(RESULT + jb.uuid, self.ttl)
-                    any_write = True
-                jb.finished = True
+            expired = done or (now_ns - jb.registered_ns) > self.max_test_ns
+            if jb.all_eps:
+                finished = expired or all(x.decision is not None for x in jb.all_eps.values())
+            else:
+                finished = expired or jb.session.decision is not None
+            if not finished:
+                continue
+            if jb.session.decision is None:
+                writes.hset(RESULT + jb.uuid, mapping=self._no_stop_fields(jb))
+                writes.expire(RESULT + jb.uuid, self.ttl)
+            for sess in jb.all_eps.values():
+                if sess.decision is None:
+                    self._write_shadow(writes, jb, sess, None)
+            any_write = True
+            jb.finished = True
         if any_write:
             writes.execute()
         for jb in jobs:
@@ -175,6 +212,19 @@ class Service:
         self.n_decisions += 1
         log.info("STOP %s tau=%d (%.0f ms) pred=%.2f Mbit/s p=%.3f", jb.uuid, d.tau, d.elapsed_ms,
                  d.predicted_bps / 1e6, d.probability)
+
+    def _write_shadow(self, pipe, jb: Job, sess: TurboTestSession, d) -> None:
+        """turbotest:shadow:<uuid> field <epsilon> = JSON decision of that classifier."""
+        if sess.epsilon in jb.shadow_written:
+            return
+        jb.shadow_written.add(sess.epsilon)
+        v = {"decision": "no_stop", "n_rows": sess.features.n_rows}
+        if d is not None:
+            v = {"decision": "stop", "tau": d.tau, "predicted_mbps": round(d.predicted_bps / 1e6, 6),
+                 "probability": round(d.probability, 6), "stop_after_ms": round(d.elapsed_ms, 1),
+                 "decided_at_ns": time.time_ns()}
+        pipe.hset(SHADOW + jb.uuid, str(sess.epsilon), json.dumps(v))
+        pipe.expire(SHADOW + jb.uuid, self.ttl)
 
     def _no_stop_fields(self, jb: Job) -> dict:
         s = jb.session
