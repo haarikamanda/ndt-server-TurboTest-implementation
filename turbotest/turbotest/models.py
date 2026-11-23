@@ -19,7 +19,7 @@ import os
 import sys
 import time
 from dataclasses import dataclass
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 import numpy as np
 
@@ -225,9 +225,15 @@ class TurboTestModels:
 
 
 class TurboTestSession:
-    """Per-test state: streaming features, regressor history, decision."""
+    """Per-test state: streaming features, regressor history, decision.
 
-    def __init__(self, models: TurboTestModels, epsilon: Optional[int] = None):
+    Immediate mode (default): Stage 1/2 run inside add()/tick() as soon as a
+    5th row closes. Deferred mode: the session only records which taus are
+    due (self.pending); the service then runs Stage 1 and Stage 2 for all
+    due tests in one batch per poll cycle (see run_batched()).
+    """
+
+    def __init__(self, models: TurboTestModels, epsilon: Optional[int] = None, deferred: bool = False):
         from .features import StreamingFeatureBuilder
 
         self.models = models
@@ -238,12 +244,26 @@ class TurboTestSession:
         self.probs: Dict[int, float] = {}
         self.decision: Optional[Decision] = None
         self.timings_ms = []  # (tau, regressor_ms, classifier_ms)
+        self.deferred = deferred
+        self.pending: List[int] = []
 
     def add(self, snapshot) -> Optional[Decision]:
         """Feed one snapshot. Returns a Decision the first time the classifier says stop."""
         if self.features.add(snapshot):
             return self._on_new_row()
         return None
+
+    def add_bin_row(self, row: np.ndarray) -> Optional[Decision]:
+        """Feed one already-aggregated 100 ms row (FEATURE_CSV_COLUMNS order).
+
+        Used to replay the 1M-test feature CSVs, which hold rows, not snapshots.
+        """
+        f = self.features
+        if f.start_ns is None:
+            f.start_ns = 0
+        f.rows.append(np.asarray(row, dtype=np.float64))
+        f.bin_index.append(len(f.rows) - 1)
+        return self._on_new_row()
 
     def flush(self) -> Optional[Decision]:
         if self.features.flush():
@@ -256,9 +276,15 @@ class TurboTestSession:
             return self._on_new_row()
         return None
 
+    def _due(self, n: int) -> bool:
+        return n % 5 == 0 and n <= 100
+
     def _on_new_row(self) -> Optional[Decision]:
         n = self.features.n_rows
-        if n % 5 != 0 or n > 100:
+        if not self._due(n):
+            return None
+        if self.deferred:
+            self.pending.append(n)
             return None
         m = self.features.matrix()
         t0 = time.perf_counter()
@@ -266,14 +292,65 @@ class TurboTestSession:
         t1 = time.perf_counter()
         c_ms = 0.0
         out = None
-        if self.decision is None and n in CLASSIFIER_TAUS:
-            p = self.classifier.prob(classifier_input(m, n, self.reg_pred_bps))
+        vec = self.classifier_vec(n, m)
+        if vec is not None:
+            p = self.classifier.prob(vec)
             c_ms = (time.perf_counter() - t1) * 1e3
-            self.probs[n] = p
-            if p >= self.models.threshold:
-                last_ts = self.features.start_ns + self.features.bin_index[-1] * 100_000_000
-                self.decision = Decision(n, self.reg_pred_bps[n], p,
-                                         (last_ts - self.features.start_ns) / 1e6 + 100.0)
-                out = self.decision
+            out = self.apply_prob(n, p)
         self.timings_ms.append((n, (t1 - t0) * 1e3, c_ms))
         return out
+
+    # ---- pieces used by the batched path ----------------------------------
+    def classifier_vec(self, n: int, m: Optional[np.ndarray] = None) -> Optional[np.ndarray]:
+        if self.decision is not None or n not in CLASSIFIER_TAUS:
+            return None
+        if m is None:
+            m = self.features.matrix()
+        return classifier_input(m, n, self.reg_pred_bps)
+
+    def apply_prob(self, n: int, p: float) -> Optional[Decision]:
+        self.probs[n] = p
+        if self.decision is None and p >= self.models.threshold:
+            f = self.features
+            last_ts = f.start_ns + f.bin_index[n - 1] * 100_000_000
+            self.decision = Decision(n, self.reg_pred_bps[n], p, (last_ts - f.start_ns) / 1e6 + 100.0)
+            return self.decision
+        return None
+
+
+def run_batched(models: TurboTestModels, sessions: List[TurboTestSession]) -> List[tuple]:
+    """Run all pending Stage 1/2 work of deferred sessions in batches.
+
+    Returns [(session, Decision)] for sessions that decided to stop. Each round
+    takes the oldest pending tau of every session, so a session that fell
+    behind still sees its taus in order (Stage 2 at tau needs Stage 1 at all
+    earlier taus).
+    """
+    decisions = []
+    while True:
+        work = [(s, s.pending.pop(0)) for s in sessions if s.pending]
+        if not work:
+            return decisions
+        mats = {id(s): s.features.matrix() for s, _ in work}
+        t0 = time.perf_counter()
+        xs = np.stack([regressor_input(mats[id(s)], n) for s, n in work])
+        preds = models.regressor.predict_bps_batch(xs)
+        for (s, n), p in zip(work, preds):
+            s.reg_pred_bps[n] = float(p)
+        t1 = time.perf_counter()
+        by_eps: Dict[int, list] = {}
+        for s, n in work:
+            v = s.classifier_vec(n, mats[id(s)])
+            if v is not None:
+                by_eps.setdefault(s.epsilon, []).append((s, n, v))
+        for eps, items in by_eps.items():
+            clf = models.classifiers[eps]
+            x = np.stack([normalize_classifier_input(v, clf.min_vals, clf.ranges) for _, _, v in items])
+            probs = clf.prob_batch(x)
+            for (s, n, _), p in zip(items, probs):
+                d = s.apply_prob(n, float(p))
+                if d is not None:
+                    decisions.append((s, d))
+        t2 = time.perf_counter()
+        for s, n in work:
+            s.timings_ms.append((n, (t1 - t0) * 1e3 / len(work), (t2 - t1) * 1e3 / len(work)))

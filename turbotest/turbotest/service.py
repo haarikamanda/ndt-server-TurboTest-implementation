@@ -35,7 +35,7 @@ from typing import Dict, List
 import redis
 
 from .features import Snapshot
-from .models import TurboTestModels, TurboTestSession
+from .models import TurboTestModels, TurboTestSession, run_batched
 
 log = logging.getLogger("turbotest")
 
@@ -88,7 +88,7 @@ class Service:
                 eps = int(j.get("epsilon") or self.models.epsilon)
             except (TypeError, ValueError):
                 eps = self.models.epsilon
-            sess = TurboTestSession(self.models, eps)
+            sess = TurboTestSession(self.models, eps, deferred=True)
             self.jobs[uuid] = Job(uuid, j.get("mode", "enforce"), time.time_ns(), sess)
             self.n_jobs += 1
             log.info("job %s mode=%s epsilon=%d", uuid, j.get("mode"), sess.epsilon)
@@ -107,27 +107,35 @@ class Service:
         now_ns = time.time_ns()
         writes = self.r.pipeline(transaction=False)
         any_write = False
+        # 1) Ingest new snapshots; sessions only mark which taus are due.
+        done_flags = {}
         for i, jb in enumerate(jobs):
             rows, done = res[2 * i], res[2 * i + 1]
+            done_flags[jb.uuid] = done
             jb.offset += len(rows)
-            t0 = time.perf_counter()
-            decision = None
             for row in rows:
                 try:
-                    s = Snapshot.parse(row.decode() if isinstance(row, bytes) else row)
+                    jb.session.add(Snapshot.parse(row.decode() if isinstance(row, bytes) else row))
                 except ValueError:
                     continue
-                d = jb.session.add(s)
-                decision = decision or d
-            if decision is None and jb.session.features.n_snapshots:
-                decision = jb.session.tick(now_ns, self.clock_margin_ns)
-            if decision is not None:
-                jb.infer_ms.append((time.perf_counter() - t0) * 1e3)
-                self._write_decision(writes, jb, decision)
-                any_write = True
+            if jb.session.features.n_snapshots:
+                jb.session.tick(now_ns, self.clock_margin_ns)
+        # 2) Stage 1 + Stage 2 for every due test, batched across tests.
+        t0 = time.perf_counter()
+        decided = run_batched(self.models, [jb.session for jb in jobs])
+        batch_ms = (time.perf_counter() - t0) * 1e3
+        by_session = {id(jb.session): jb for jb in jobs}
+        for sess, d in decided:
+            jb = by_session[id(sess)]
+            jb.infer_ms.append(batch_ms)
+            self._write_decision(writes, jb, d, batch_ms)
+            any_write = True
+        # 3) Retire finished tests.
+        for jb in jobs:
+            done = done_flags[jb.uuid]
             age = now_ns - jb.registered_ns
             if done or jb.session.decision is not None or age > self.max_test_ns:
-                if jb.session.decision is None and (done or age > self.max_test_ns):
+                if jb.session.decision is None:
                     writes.hset(RESULT + jb.uuid, mapping=self._no_stop_fields(jb))
                     writes.expire(RESULT + jb.uuid, self.ttl)
                     any_write = True
@@ -138,7 +146,7 @@ class Service:
             if jb.finished:
                 self.jobs.pop(jb.uuid, None)
 
-    def _write_decision(self, pipe, jb: Job, d) -> None:
+    def _write_decision(self, pipe, jb: Job, d, batch_ms: float = 0.0) -> None:
         now = time.time_ns()
         s = jb.session
         timings = s.timings_ms
@@ -154,6 +162,7 @@ class Service:
             "decided_at_ns": now,
             "first_snapshot_ns": s.features.start_ns or 0,
             "n_snapshots": s.features.n_snapshots,
+            "inference_batch_ms": f"{batch_ms:.3f}",
             "regressor_ms_last": f"{timings[-1][1]:.3f}" if timings else "",
             "classifier_ms_last": f"{timings[-1][2]:.3f}" if timings else "",
             "probs": json.dumps({str(k): round(v, 4) for k, v in s.probs.items()}),

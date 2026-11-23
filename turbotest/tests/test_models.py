@@ -65,3 +65,25 @@ def test_latency_budget(models):
         models.classifier.prob(classifier_input(m, 50, preds))
         ts.append(time.perf_counter() - t0)
     assert np.percentile(ts, 99) < 0.050
+
+
+def test_batched_equals_immediate(models):
+    """The service's cross-test batching must not change any decision."""
+    from turbotest.models import run_batched
+
+    files = sorted(os.listdir(FEAT_DIR))[7::50021][:12]
+    mats = [features_from_dataframe(pd.read_csv(os.path.join(FEAT_DIR, fn))) for fn in files]
+    imm = [TurboTestSession(models) for _ in files]
+    dfr = [TurboTestSession(models, deferred=True) for _ in files]
+    got = {}
+    for i in range(max(m.shape[0] for m in mats)):
+        for k, m in enumerate(mats):
+            if i < m.shape[0]:
+                imm[k].add_bin_row(m[i])
+                dfr[k].add_bin_row(m[i])
+        for s, d in run_batched(models, dfr):
+            got[id(s)] = d
+    for a, b in zip(imm, dfr):
+        assert (a.decision.tau if a.decision else None) == (b.decision.tau if b.decision else None)
+        for t, p in a.probs.items():
+            assert b.probs[t] == pytest.approx(p, abs=1e-5)
